@@ -1,0 +1,1118 @@
+/*
+ * =============================================================================
+ *  sci_calc.c — Scientific Calculator in C
+ * =============================================================================
+ *  Features:
+ *    - Recursive-descent expression parser (PEMDAS/BODMAS)
+ *    - Operators: + - * / % ^ !
+ *    - Trigonometry : sin cos tan  asin acos atan (degree/radian/grad mode)
+ *    - Hyperbolic   : sinh cosh tanh  asinh acosh atanh
+ *    - Logarithms   : ln log log2 log10 exp
+ *    - Misc         : sqrt cbrt abs ceil floor round fact sign inv
+ *    - Constants    : pi  e  phi  ans  inf
+ *    - Memory slots : mem0–mem9 (read in expr); :ms :mr :ma :mc commands
+ *    - History      : last 50 calculations (:hist)
+ *    - Statistics   : mean median std-dev variance min max range (:stat)
+ *    - Matrix ops   : add mul transpose determinant for 2×2 and 3×3 (:matrix)
+ *    - Unit convert : length and temperature (:conv)
+ *    - Extras       : quadratic solver, prime test, base conversion (:extras)
+ *    - Angle modes  : :deg  :rad  :grad
+ *
+ *  Compile:
+ *    gcc -Wall -Wextra -O2 -o sci_calc sci_calc.c -lm
+ *
+ *  Run:
+ *    ./sci_calc
+ * =============================================================================
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <ctype.h>
+#include <errno.h>
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ *  SECTION 1 — CONSTANTS & LIMITS
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+#define CALC_PI       3.14159265358979323846
+#define CALC_E        2.71828182845904523536
+#define CALC_PHI      1.61803398874989484820   /* Golden Ratio              */
+#define CALC_SQRT2    1.41421356237309504880   /* √2                        */
+#define CALC_LN2      0.69314718055994530942   /* ln(2)                     */
+
+#define MAX_EXPR      512
+#define MAX_HIST      50
+#define MAX_MEM       10
+#define MAX_DATA      256
+#define VERSION       "1.0"
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ *  SECTION 2 — TYPES & STATE
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+typedef enum { MODE_DEG = 0, MODE_RAD, MODE_GRAD } AngleMode;
+
+typedef enum {
+    ERR_NONE = 0,
+    ERR_DIV_ZERO,
+    ERR_DOMAIN,
+    ERR_SYNTAX,
+    ERR_OVERFLOW,
+    ERR_UNDEF
+} CalcError;
+
+typedef struct { char expr[MAX_EXPR]; double result; } HistEntry;
+
+/* Global calculator state */
+static AngleMode g_mode       = MODE_DEG;
+static CalcError g_error      = ERR_NONE;
+static double    g_ans        = 0.0;
+static double    g_mem[MAX_MEM];
+static HistEntry g_history[MAX_HIST];
+static int       g_hist_n     = 0;
+
+/* Statistics buffer */
+static double    g_data[MAX_DATA];
+static int       g_data_n     = 0;
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ *  SECTION 3 — ERROR HELPERS
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+static void set_err(CalcError e) { g_error = e; }
+
+static const char *err_msg(CalcError e)
+{
+    switch (e) {
+        case ERR_DIV_ZERO: return "Error: Division by zero";
+        case ERR_DOMAIN:   return "Error: Domain error (invalid input for function)";
+        case ERR_SYNTAX:   return "Error: Syntax error in expression";
+        case ERR_OVERFLOW: return "Error: Numeric overflow";
+        case ERR_UNDEF:    return "Error: Undefined function or variable";
+        default:           return "Error: Unknown error";
+    }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ *  SECTION 4 — ANGLE CONVERSION
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+/* Convert angle from current mode to radians (for trig input) */
+static double to_rad(double a)
+{
+    switch (g_mode) {
+        case MODE_DEG:  return a * CALC_PI / 180.0;
+        case MODE_GRAD: return a * CALC_PI / 200.0;
+        default:        return a;
+    }
+}
+
+/* Convert radians back to current mode (for inverse trig output) */
+static double from_rad(double r)
+{
+    switch (g_mode) {
+        case MODE_DEG:  return r * 180.0 / CALC_PI;
+        case MODE_GRAD: return r * 200.0 / CALC_PI;
+        default:        return r;
+    }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ *  SECTION 5 — MATH UTILITIES
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+static double safe_sqrt(double x)
+{
+    if (x < 0.0) { set_err(ERR_DOMAIN); return 0.0; }
+    return sqrt(x);
+}
+
+static double safe_log(double x)
+{
+    if (x <= 0.0) { set_err(ERR_DOMAIN); return 0.0; }
+    return log(x);
+}
+
+static double safe_log10(double x)
+{
+    if (x <= 0.0) { set_err(ERR_DOMAIN); return 0.0; }
+    return log10(x);
+}
+
+static double safe_log2(double x)
+{
+    if (x <= 0.0) { set_err(ERR_DOMAIN); return 0.0; }
+    return log2(x);
+}
+
+static double safe_asin(double x)
+{
+    if (x < -1.0 || x > 1.0) { set_err(ERR_DOMAIN); return 0.0; }
+    return asin(x);
+}
+
+static double safe_acos(double x)
+{
+    if (x < -1.0 || x > 1.0) { set_err(ERR_DOMAIN); return 0.0; }
+    return acos(x);
+}
+
+static double safe_acosh(double x)
+{
+    if (x < 1.0) { set_err(ERR_DOMAIN); return 0.0; }
+    return acosh(x);
+}
+
+static double safe_atanh(double x)
+{
+    if (x <= -1.0 || x >= 1.0) { set_err(ERR_DOMAIN); return 0.0; }
+    return atanh(x);
+}
+
+static double safe_tan(double x)
+{
+    double r = to_rad(x);
+    double c = cos(r);
+    if (fabs(c) < 1e-15) { set_err(ERR_DOMAIN); return 0.0; }
+    return sin(r) / c;
+}
+
+static double factorial(double n)
+{
+    if (n < 0.0 || n != floor(n)) { set_err(ERR_DOMAIN); return 0.0; }
+    if (n > 170.0) { set_err(ERR_OVERFLOW); return 0.0; }
+    double r = 1.0;
+    for (int i = 2; i <= (int)n; i++) r *= i;
+    return r;
+}
+
+static double gcd_d(double a, double b)
+{
+    a = fabs(a); b = fabs(b);
+    while (b > 1e-9) { double t = fmod(a, b); a = b; b = t; }
+    return a;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ *  SECTION 6 — FUNCTION WRAPPERS (for table lookup)
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+static double fn_sin(double x)   { return sin(to_rad(x)); }
+static double fn_cos(double x)   { return cos(to_rad(x)); }
+static double fn_tan(double x)   { return safe_tan(x); }
+static double fn_asin(double x)  { return from_rad(safe_asin(x)); }
+static double fn_acos(double x)  { return from_rad(safe_acos(x)); }
+static double fn_atan(double x)  { return from_rad(atan(x)); }
+static double fn_sinh(double x)  { return sinh(x); }
+static double fn_cosh(double x)  { return cosh(x); }
+static double fn_tanh(double x)  { return tanh(x); }
+static double fn_asinh(double x) { return asinh(x); }
+static double fn_acosh(double x) { return safe_acosh(x); }
+static double fn_atanh(double x) { return safe_atanh(x); }
+static double fn_ln(double x)    { return safe_log(x); }
+static double fn_log10(double x) { return safe_log10(x); }
+static double fn_log2(double x)  { return safe_log2(x); }
+static double fn_exp(double x)   { return exp(x); }
+static double fn_sqrt(double x)  { return safe_sqrt(x); }
+static double fn_cbrt(double x)  { return cbrt(x); }
+static double fn_abs(double x)   { return fabs(x); }
+static double fn_ceil(double x)  { return ceil(x); }
+static double fn_floor(double x) { return floor(x); }
+static double fn_round(double x) { return round(x); }
+static double fn_fact(double x)  { return factorial(x); }
+static double fn_sign(double x)  { return (x > 0.0) - (x < 0.0); }
+static double fn_inv(double x)   {
+    if (x == 0.0) { set_err(ERR_DIV_ZERO); return 0.0; }
+    return 1.0 / x;
+}
+static double fn_sq(double x)    { return x * x; }
+static double fn_deg(double x)   { return x * 180.0 / CALC_PI; }   /* rad→deg */
+static double fn_rad(double x)   { return x * CALC_PI / 180.0; }   /* deg→rad */
+static double fn_log2b(double x) { return safe_log2(x); }
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ *  SECTION 7 — FUNCTION REGISTRY
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+typedef struct { const char *name; double (*fn)(double); } FnEntry;
+
+static FnEntry g_fns[] = {
+    /* Trigonometric */
+    {"sin",    fn_sin},
+    {"cos",    fn_cos},
+    {"tan",    fn_tan},
+    {"asin",   fn_asin},
+    {"acos",   fn_acos},
+    {"atan",   fn_atan},
+    {"arcsin", fn_asin},
+    {"arccos", fn_acos},
+    {"arctan", fn_atan},
+    /* Hyperbolic */
+    {"sinh",   fn_sinh},
+    {"cosh",   fn_cosh},
+    {"tanh",   fn_tanh},
+    {"asinh",  fn_asinh},
+    {"acosh",  fn_acosh},
+    {"atanh",  fn_atanh},
+    /* Logarithms / exponential */
+    {"ln",     fn_ln},
+    {"log",    fn_log10},
+    {"log10",  fn_log10},
+    {"log2",   fn_log2b},
+    {"exp",    fn_exp},
+    /* Roots & powers */
+    {"sqrt",   fn_sqrt},
+    {"cbrt",   fn_cbrt},
+    {"sq",     fn_sq},
+    /* Rounding */
+    {"abs",    fn_abs},
+    {"ceil",   fn_ceil},
+    {"floor",  fn_floor},
+    {"round",  fn_round},
+    /* Misc */
+    {"fact",   fn_fact},
+    {"sign",   fn_sign},
+    {"inv",    fn_inv},
+    /* Angle conversion */
+    {"deg",    fn_deg},
+    {"rad",    fn_rad},
+    {NULL,     NULL}
+};
+
+static double call_fn(const char *name, double arg)
+{
+    for (int i = 0; g_fns[i].name; i++)
+        if (strcmp(g_fns[i].name, name) == 0)
+            return g_fns[i].fn(arg);
+    set_err(ERR_UNDEF);
+    return 0.0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ *  SECTION 8 — RECURSIVE-DESCENT EXPRESSION PARSER
+ *
+ *  Grammar (highest precedence last in call chain → deepest recursion first):
+ *
+ *    expr     = term   { ('+' | '-')  term   }
+ *    term     = factor { ('*' | '/' | '%') factor }
+ *    factor   = unary  { '^' factor }          (right-associative)
+ *    unary    = '-' primary | '+' primary | primary
+ *    primary  = number | '(' expr ')' | ident [ '(' expr ')' ]
+ *
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+/* Forward declarations */
+static double parse_expr(const char **p);
+static double parse_term(const char **p);
+static double parse_factor(const char **p);
+static double parse_unary(const char **p);
+static double parse_primary(const char **p);
+
+static void skip_ws(const char **p)
+{
+    while (**p == ' ' || **p == '\t') (*p)++;
+}
+
+static double parse_number(const char **p)
+{
+    skip_ws(p);
+    char *end;
+    errno = 0;
+    double v = strtod(*p, &end);
+    if (end == *p) { set_err(ERR_SYNTAX); return 0.0; }
+    *p = end;
+    if (errno == ERANGE) set_err(ERR_OVERFLOW);
+    return v;
+}
+
+/* Read alphabetic identifier into buf; returns length */
+static int read_ident(const char **p, char *buf, int max)
+{
+    skip_ws(p);
+    int n = 0;
+    while ((isalpha((unsigned char)**p) || **p == '_') && n < max - 1)
+        buf[n++] = *(*p)++;
+    buf[n] = '\0';
+    return n;
+}
+
+static double parse_primary(const char **p)
+{
+    skip_ws(p);
+
+    /* Parenthesised expression */
+    if (**p == '(') {
+        (*p)++;
+        double v = parse_expr(p);
+        skip_ws(p);
+        if (**p != ')') { set_err(ERR_SYNTAX); return 0.0; }
+        (*p)++;
+        return v;
+    }
+
+    /* Numeric literal */
+    if (isdigit((unsigned char)**p) || **p == '.') return parse_number(p);
+
+    /* Identifier: constant, memory slot, or function */
+    if (isalpha((unsigned char)**p) || **p == '_') {
+        char name[64];
+        read_ident(p, name, sizeof(name));
+        skip_ws(p);
+
+        /* ── Named constants ── */
+        if (!strcmp(name,"pi")  || !strcmp(name,"PI"))   return CALC_PI;
+        if (!strcmp(name,"e"))                             return CALC_E;
+        if (!strcmp(name,"phi"))                           return CALC_PHI;
+        if (!strcmp(name,"sqrt2"))                         return CALC_SQRT2;
+        if (!strcmp(name,"ln2"))                           return CALC_LN2;
+        if (!strcmp(name,"ans"))                           return g_ans;
+        if (!strcmp(name,"inf"))                           return HUGE_VAL;
+
+        /* ── Memory slots: mem0 … mem9 ── */
+        if (!strncmp(name,"mem",3) && isdigit((unsigned char)name[3]) && !name[4]) {
+            int idx = name[3] - '0';
+            return g_mem[idx];
+        }
+
+        /* ── Function call: name(arg) ── */
+        if (**p == '(') {
+            (*p)++;
+            double arg = parse_expr(p);
+            skip_ws(p);
+            if (**p != ')') { set_err(ERR_SYNTAX); return 0.0; }
+            (*p)++;
+            return call_fn(name, arg);
+        }
+
+        set_err(ERR_UNDEF);
+        return 0.0;
+    }
+
+    set_err(ERR_SYNTAX);
+    return 0.0;
+}
+
+static double parse_unary(const char **p)
+{
+    skip_ws(p);
+    if (**p == '-') { (*p)++; return -parse_unary(p); }
+    if (**p == '+') { (*p)++; return  parse_unary(p); }
+    return parse_primary(p);
+}
+
+static double parse_factor(const char **p)
+{
+    double base = parse_unary(p);
+    skip_ws(p);
+
+    /* Postfix factorial:  expr! */
+    if (**p == '!') { (*p)++; return factorial(base); }
+
+    /* Right-associative exponentiation: a^b^c = a^(b^c) */
+    if (**p == '^') {
+        (*p)++;
+        double exponent = parse_factor(p);   /* recurse for right-assoc */
+        if (base < 0.0 && exponent != floor(exponent))
+            { set_err(ERR_DOMAIN); return 0.0; }
+        return pow(base, exponent);
+    }
+    return base;
+}
+
+static double parse_term(const char **p)
+{
+    double left = parse_factor(p);
+    skip_ws(p);
+    while (**p == '*' || **p == '/' || **p == '%') {
+        char op = *(*p)++;
+        double right = parse_factor(p);
+        if (op == '*') {
+            left *= right;
+        } else {
+            if (right == 0.0) { set_err(ERR_DIV_ZERO); return 0.0; }
+            left = (op == '/') ? left / right : fmod(left, right);
+        }
+        skip_ws(p);
+    }
+    return left;
+}
+
+static double parse_expr(const char **p)
+{
+    double left = parse_term(p);
+    skip_ws(p);
+    while (**p == '+' || **p == '-') {
+        char op = *(*p)++;
+        double right = parse_term(p);
+        left = (op == '+') ? left + right : left - right;
+        skip_ws(p);
+    }
+    return left;
+}
+
+/* Top-level evaluate — returns result; check g_error after call */
+static double evaluate(const char *expr)
+{
+    g_error = ERR_NONE;
+    const char *p = expr;
+    skip_ws(&p);
+    if (*p == '\0') return g_ans;
+    double result = parse_expr(&p);
+    skip_ws(&p);
+    if (*p != '\0' && g_error == ERR_NONE) set_err(ERR_SYNTAX);
+    return result;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ *  SECTION 9 — HISTORY
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+static void hist_add(const char *expr, double result)
+{
+    if (g_hist_n == MAX_HIST)
+        memmove(g_history, g_history + 1, (MAX_HIST-1) * sizeof(HistEntry));
+    else
+        g_hist_n++;
+    strncpy(g_history[g_hist_n-1].expr, expr, MAX_EXPR-1);
+    g_history[g_hist_n-1].result = result;
+}
+
+static void hist_print(void)
+{
+    if (!g_hist_n) { printf("  (no history)\n\n"); return; }
+    printf("\n  %-3s  %-42s  %s\n", "#", "Expression", "Result");
+    printf("  %s\n", "───────────────────────────────────────────────────────");
+    for (int i = 0; i < g_hist_n; i++)
+        printf("  %-3d  %-42s  %.12g\n",
+               i + 1, g_history[i].expr, g_history[i].result);
+    printf("\n");
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ *  SECTION 10 — MEMORY COMMANDS
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+static void mem_list(void)
+{
+    printf("\n  Memory Slots:\n");
+    for (int i = 0; i < MAX_MEM; i++)
+        printf("    mem%d = %.12g\n", i, g_mem[i]);
+    printf("\n");
+}
+
+static void mem_store(int s, double v) {
+    if (s < 0 || s >= MAX_MEM) return;
+    g_mem[s] = v;
+    printf("  mem%d ← %.12g\n\n", s, v);
+}
+
+static void mem_recall(int s) {
+    if (s < 0 || s >= MAX_MEM) return;
+    printf("  mem%d = %.12g\n\n", s, g_mem[s]);
+}
+
+static void mem_add_slot(int s, double v) {
+    if (s < 0 || s >= MAX_MEM) return;
+    g_mem[s] += v;
+    printf("  mem%d += %.12g  →  %.12g\n\n", s, v, g_mem[s]);
+}
+
+static void mem_clear(int s) {
+    if (s < 0 || s >= MAX_MEM) return;
+    g_mem[s] = 0.0;
+    printf("  mem%d cleared\n\n", s);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ *  SECTION 11 — STATISTICS MODULE
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+static int cmp_dbl(const void *a, const void *b)
+{
+    double da = *(double*)a, db = *(double*)b;
+    return (da > db) - (da < db);
+}
+
+static void stat_compute(void)
+{
+    if (!g_data_n) { printf("  No data yet. Use  add <value>\n\n"); return; }
+
+    double sum = 0.0;
+    for (int i = 0; i < g_data_n; i++) sum += g_data[i];
+    double mean = sum / g_data_n;
+
+    double var_sum = 0.0;
+    for (int i = 0; i < g_data_n; i++) {
+        double d = g_data[i] - mean;
+        var_sum += d * d;
+    }
+    double pop_var  = var_sum / g_data_n;
+    double samp_var = (g_data_n > 1) ? var_sum / (g_data_n - 1) : 0.0;
+
+    double sorted[MAX_DATA];
+    memcpy(sorted, g_data, g_data_n * sizeof(double));
+    qsort(sorted, g_data_n, sizeof(double), cmp_dbl);
+
+    double median = (g_data_n % 2 == 0)
+        ? (sorted[g_data_n/2-1] + sorted[g_data_n/2]) / 2.0
+        : sorted[g_data_n / 2];
+
+    double ss = 0.0;
+    for (int i = 0; i < g_data_n; i++) ss += g_data[i] * g_data[i];
+
+    double geo = 0.0;
+    int geo_ok = 1;
+    for (int i = 0; i < g_data_n; i++) {
+        if (g_data[i] <= 0.0) { geo_ok = 0; break; }
+        geo += log(g_data[i]);
+    }
+    if (geo_ok) geo = exp(geo / g_data_n);
+
+    printf("\n  ╔═══════════════════════════════════════╗\n");
+    printf("  ║       Statistical Summary             ║\n");
+    printf("  ╠═══════════════════════════════════════╣\n");
+    printf("  ║  Count            : %-18d║\n", g_data_n);
+    printf("  ║  Sum              : %-18.8g║\n", sum);
+    printf("  ║  Mean (μ)         : %-18.8g║\n", mean);
+    printf("  ║  Median           : %-18.8g║\n", median);
+    printf("  ║  Min              : %-18.8g║\n", sorted[0]);
+    printf("  ║  Max              : %-18.8g║\n", sorted[g_data_n-1]);
+    printf("  ║  Range            : %-18.8g║\n", sorted[g_data_n-1] - sorted[0]);
+    printf("  ║  Pop. Variance    : %-18.8g║\n", pop_var);
+    printf("  ║  Pop. Std Dev (σ) : %-18.8g║\n", sqrt(pop_var));
+    printf("  ║  Samp. Variance   : %-18.8g║\n", samp_var);
+    printf("  ║  Samp. Std Dev(s) : %-18.8g║\n", sqrt(samp_var));
+    printf("  ║  Sum of Squares   : %-18.8g║\n", ss);
+    if (geo_ok)
+    printf("  ║  Geometric Mean   : %-18.8g║\n", geo);
+    printf("  ╚═══════════════════════════════════════╝\n\n");
+}
+
+static void stat_mode(void)
+{
+    char buf[256];
+    printf("\n  ══ Statistics Mode ══  (:done to return)\n");
+    printf("  Commands:  add <val>  |  clear  |  list  |  compute\n\n");
+    while (1) {
+        printf("  stat> "); fflush(stdout);
+        if (!fgets(buf, sizeof(buf), stdin)) break;
+        buf[strcspn(buf, "\n")] = '\0';
+        if (!strcmp(buf,":done")||!strcmp(buf,":q")) break;
+
+        if (!strncmp(buf,"add ",4)) {
+            if (g_data_n >= MAX_DATA) { printf("  Buffer full (%d).\n", MAX_DATA); continue; }
+            g_data[g_data_n++] = atof(buf+4);
+            printf("  Added %.8g  (n = %d)\n", g_data[g_data_n-1], g_data_n);
+        } else if (!strcmp(buf,"clear")) {
+            g_data_n = 0; printf("  Data cleared.\n");
+        } else if (!strcmp(buf,"list")) {
+            printf("  Data:");
+            for (int i = 0; i < g_data_n; i++) printf(" %.6g", g_data[i]);
+            printf("\n");
+        } else if (!strcmp(buf,"compute")) {
+            stat_compute();
+        } else {
+            printf("  Unknown. Use: add <val> | clear | list | compute\n");
+        }
+    }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ *  SECTION 12 — MATRIX MODULE (up to 3×3)
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+typedef struct { double m[3][3]; int r, c; } Matrix;
+
+static void mat_print(const Matrix *M, const char *lbl)
+{
+    printf("  %s (%d×%d):\n", lbl, M->r, M->c);
+    for (int i = 0; i < M->r; i++) {
+        printf("    [");
+        for (int j = 0; j < M->c; j++) printf(" %10.4f", M->m[i][j]);
+        printf("  ]\n");
+    }
+}
+
+static Matrix mat_add(const Matrix *A, const Matrix *B)
+{
+    Matrix C = *A;
+    for (int i=0;i<A->r;i++) for(int j=0;j<A->c;j++) C.m[i][j]=A->m[i][j]+B->m[i][j];
+    return C;
+}
+
+static Matrix mat_sub(const Matrix *A, const Matrix *B)
+{
+    Matrix C = *A;
+    for (int i=0;i<A->r;i++) for(int j=0;j<A->c;j++) C.m[i][j]=A->m[i][j]-B->m[i][j];
+    return C;
+}
+
+static Matrix mat_mul(const Matrix *A, const Matrix *B)
+{
+    Matrix C; memset(&C,0,sizeof(C)); C.r=A->r; C.c=B->c;
+    for (int i=0;i<A->r;i++) for(int j=0;j<B->c;j++) for(int k=0;k<A->c;k++)
+        C.m[i][j] += A->m[i][k] * B->m[k][j];
+    return C;
+}
+
+static Matrix mat_trans(const Matrix *A)
+{
+    Matrix T; T.r=A->c; T.c=A->r;
+    for(int i=0;i<A->r;i++) for(int j=0;j<A->c;j++) T.m[j][i]=A->m[i][j];
+    return T;
+}
+
+static double mat_det2(const Matrix *A)
+{ return A->m[0][0]*A->m[1][1] - A->m[0][1]*A->m[1][0]; }
+
+static double mat_det3(const Matrix *A)
+{
+    return A->m[0][0]*(A->m[1][1]*A->m[2][2]-A->m[1][2]*A->m[2][1])
+          -A->m[0][1]*(A->m[1][0]*A->m[2][2]-A->m[1][2]*A->m[2][0])
+          +A->m[0][2]*(A->m[1][0]*A->m[2][1]-A->m[1][1]*A->m[2][0]);
+}
+
+static int mat_input(Matrix *M, const char *lbl)
+{
+    char buf[256];
+    printf("  %s — size (2 or 3)? ", lbl);
+    if (!fgets(buf,sizeof(buf),stdin)) return 0;
+    int n = atoi(buf);
+    if (n<2||n>3) { printf("  Must be 2 or 3.\n"); return 0; }
+    M->r = M->c = n;
+    printf("  Enter %d rows, each with %d space-separated values:\n", n, n);
+    for (int i = 0; i < n; i++) {
+        printf("    Row %d: ", i+1);
+        if (!fgets(buf,sizeof(buf),stdin)) return 0;
+        char *tok = strtok(buf," \t\n");
+        for (int j=0; j<n && tok; j++, tok=strtok(NULL," \t\n"))
+            M->m[i][j] = atof(tok);
+    }
+    return 1;
+}
+
+static void matrix_mode(void)
+{
+    char buf[256];
+    Matrix A, B, C;
+    memset(&A,0,sizeof(A)); memset(&B,0,sizeof(B));
+    printf("\n  ══ Matrix Mode ══  (:done to return)\n");
+    printf("  Commands: input A | input B | add | sub | mul | trans A | trans B |\n");
+    printf("            det A | det B\n\n");
+    while (1) {
+        printf("  mat> "); fflush(stdout);
+        if (!fgets(buf,sizeof(buf),stdin)) break;
+        buf[strcspn(buf,"\n")] = '\0';
+        if (!strcmp(buf,":done")||!strcmp(buf,":q")) break;
+
+        if (!strcmp(buf,"input A")) { if(mat_input(&A,"Matrix A")) mat_print(&A,"A"); }
+        else if (!strcmp(buf,"input B")) { if(mat_input(&B,"Matrix B")) mat_print(&B,"B"); }
+        else if (!strcmp(buf,"add")) {
+            if(A.r!=B.r||A.c!=B.c){printf("  Dimension mismatch.\n");continue;}
+            C=mat_add(&A,&B); mat_print(&C,"A + B");
+        } else if (!strcmp(buf,"sub")) {
+            if(A.r!=B.r||A.c!=B.c){printf("  Dimension mismatch.\n");continue;}
+            C=mat_sub(&A,&B); mat_print(&C,"A - B");
+        } else if (!strcmp(buf,"mul")) {
+            if(A.c!=B.r){printf("  Dimension mismatch (A.cols must = B.rows).\n");continue;}
+            C=mat_mul(&A,&B); mat_print(&C,"A × B");
+        } else if (!strcmp(buf,"trans A")) { C=mat_trans(&A); mat_print(&C,"Aᵀ"); }
+        else if (!strcmp(buf,"trans B")) { C=mat_trans(&B); mat_print(&C,"Bᵀ"); }
+        else if (!strcmp(buf,"det A")) {
+            double d=(A.r==2)?mat_det2(&A):mat_det3(&A);
+            printf("  det(A) = %.8g\n\n", d);
+        } else if (!strcmp(buf,"det B")) {
+            double d=(B.r==2)?mat_det2(&B):mat_det3(&B);
+            printf("  det(B) = %.8g\n\n", d);
+        } else { printf("  Unknown command.\n"); }
+    }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ *  SECTION 13 — UNIT CONVERSION MODULE
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+typedef struct { const char *sym; double to_base; } UnitRow;
+
+static void conv_length(double val, const char *from, const char *to)
+{
+    static UnitRow tbl[] = {
+        {"m",0.01},{"km",10.0},{"cm",0.0001},{"mm",0.00001},
+        {"in",0.000254},{"ft",0.003048},{"yd",0.009144},
+        {"mi",16.09344},{"nm",18.52},{"um",0.00000001},{NULL,0}
+    };
+    /* base unit = 1 cm */
+    double ff=0, tf=0;
+    for(int i=0;tbl[i].sym;i++){
+        if(!strcmp(tbl[i].sym,from)) ff=tbl[i].to_base;
+        if(!strcmp(tbl[i].sym,to))   tf=tbl[i].to_base;
+    }
+    if(!ff||!tf){printf("  Unknown unit (try m km cm mm in ft yd mi nm um).\n\n");return;}
+    printf("  %.8g %s = %.8g %s\n\n", val, from, val*ff/tf, to);
+}
+
+static void conv_weight(double val, const char *from, const char *to)
+{
+    static UnitRow tbl[] = {
+        {"kg",1.0},{"g",0.001},{"mg",0.000001},
+        {"lb",0.45359237},{"oz",0.02834952},{"t",1000.0},{NULL,0}
+    };
+    double ff=0,tf=0;
+    for(int i=0;tbl[i].sym;i++){
+        if(!strcmp(tbl[i].sym,from)) ff=tbl[i].to_base;
+        if(!strcmp(tbl[i].sym,to))   tf=tbl[i].to_base;
+    }
+    if(!ff||!tf){printf("  Unknown unit (try kg g mg lb oz t).\n\n");return;}
+    printf("  %.8g %s = %.8g %s\n\n", val, from, val*ff/tf, to);
+}
+
+static void conv_temp(double val, char from, char to)
+{
+    double c;
+    switch(from){
+        case 'C':c=val;break;
+        case 'F':c=(val-32.0)*5.0/9.0;break;
+        case 'K':c=val-273.15;break;
+        default:printf("  Unknown unit (C F K).\n\n");return;
+    }
+    double r;
+    switch(to){
+        case 'C':r=c;break;
+        case 'F':r=c*9.0/5.0+32.0;break;
+        case 'K':r=c+273.15;break;
+        default:printf("  Unknown unit (C F K).\n\n");return;
+    }
+    printf("  %.6g°%c = %.6g°%c\n\n", val, from, r, to);
+}
+
+static void conv_mode(void)
+{
+    char buf[256];
+    printf("\n  ══ Unit Conversion Mode ══  (:done to return)\n");
+    printf("  Commands:\n");
+    printf("    len  <val> <from> <to>   e.g.  len 5 km m\n");
+    printf("    mass <val> <from> <to>   e.g.  mass 70 kg lb\n");
+    printf("    temp <val> <from> <to>   e.g.  temp 100 C F   (units: C F K)\n\n");
+    while (1) {
+        printf("  conv> "); fflush(stdout);
+        if (!fgets(buf,sizeof(buf),stdin)) break;
+        buf[strcspn(buf,"\n")] = '\0';
+        if (!strcmp(buf,":done")||!strcmp(buf,":q")) break;
+        char u1[16],u2[16]; double val;
+        if (!strncmp(buf,"len ",4) && sscanf(buf+4,"%lf %15s %15s",&val,u1,u2)==3)
+            conv_length(val,u1,u2);
+        else if (!strncmp(buf,"mass ",5) && sscanf(buf+5,"%lf %15s %15s",&val,u1,u2)==3)
+            conv_weight(val,u1,u2);
+        else if (!strncmp(buf,"temp ",5) && sscanf(buf+5,"%lf %15s %15s",&val,u1,u2)==3)
+            conv_temp(val,u1[0],u2[0]);
+        else printf("  Usage: len <v> <u> <u>  |  mass <v> <u> <u>  |  temp <v> <u> <u>\n");
+    }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ *  SECTION 14 — EXTRAS: Quadratic, Primes, Base Conversion
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+static void solve_quadratic(double a, double b, double c)
+{
+    printf("\n  Quadratic: (%.6g)x² + (%.6g)x + (%.6g) = 0\n", a, b, c);
+    if (a == 0.0) {
+        if (b == 0.0) { printf("  Not a valid equation.\n\n"); return; }
+        printf("  Linear solution: x = %.8g\n\n", -c/b);
+        return;
+    }
+    double disc = b*b - 4.0*a*c;
+    if (disc > 0.0) {
+        double r1 = (-b + sqrt(disc)) / (2.0*a);
+        double r2 = (-b - sqrt(disc)) / (2.0*a);
+        printf("  Two real roots:\n    x₁ = %.10g\n    x₂ = %.10g\n\n", r1, r2);
+    } else if (disc == 0.0) {
+        printf("  One repeated root:\n    x = %.10g\n\n", -b/(2.0*a));
+    } else {
+        double re = -b/(2.0*a);
+        double im =  sqrt(-disc)/(2.0*a);
+        printf("  Two complex roots:\n    x₁ = %.8g + %.8gi\n    x₂ = %.8g - %.8gi\n\n",
+               re, im, re, im);
+    }
+}
+
+static int is_prime(long long n)
+{
+    if (n < 2)  return 0;
+    if (n == 2) return 1;
+    if (n % 2 == 0) return 0;
+    for (long long i = 3; i * i <= n; i += 2)
+        if (n % i == 0) return 0;
+    return 1;
+}
+
+static void print_primes_up_to(long long limit)
+{
+    printf("  Primes up to %lld:\n  ", limit);
+    int count = 0;
+    for (long long i = 2; i <= limit; i++) {
+        if (is_prime(i)) { printf("%lld ", i); count++; }
+    }
+    printf("\n  Total: %d primes\n\n", count);
+}
+
+static void base_convert(long long n, int base)
+{
+    if (base < 2 || base > 16) { printf("  Base must be 2–16.\n\n"); return; }
+    char digits[] = "0123456789ABCDEF";
+    char buf[128]; int idx = 0;
+    long long nn = (n < 0) ? -n : n;
+    if (nn == 0) { printf("  Base %d: 0\n\n", base); return; }
+    while (nn > 0) { buf[idx++] = digits[nn % base]; nn /= base; }
+    if (n < 0) buf[idx++] = '-';
+    printf("  Decimal %lld  →  Base-%d: ", n, base);
+    for (int i = idx-1; i >= 0; i--) putchar(buf[i]);
+    printf("\n\n");
+}
+
+static void extras_mode(void)
+{
+    char buf[256];
+    printf("\n  ══ Extras Mode ══  (:done to return)\n");
+    printf("  Commands:\n");
+    printf("    quad <a> <b> <c>       — solve ax²+bx+c=0\n");
+    printf("    prime <n>              — test if n is prime\n");
+    printf("    primes <limit>         — list primes up to limit\n");
+    printf("    gcd <a> <b>            — greatest common divisor\n");
+    printf("    lcm <a> <b>            — least common multiple\n");
+    printf("    base <n> <base>        — convert decimal n to given base\n\n");
+    while (1) {
+        printf("  extras> "); fflush(stdout);
+        if (!fgets(buf,sizeof(buf),stdin)) break;
+        buf[strcspn(buf,"\n")] = '\0';
+        if (!strcmp(buf,":done")||!strcmp(buf,":q")) break;
+
+        double a,b,c;
+        long long ia, ib;
+        if (!strncmp(buf,"quad ",5) && sscanf(buf+5,"%lf %lf %lf",&a,&b,&c)==3) {
+            solve_quadratic(a,b,c);
+        } else if (!strncmp(buf,"prime ",6)) {
+            long long n = atoll(buf+6);
+            printf("  %lld is %s prime.\n\n", n, is_prime(n)?"":"NOT ");
+        } else if (!strncmp(buf,"primes ",7)) {
+            long long lim = atoll(buf+7);
+            if(lim>100000){printf("  Limit too large (max 100000).\n\n");continue;}
+            print_primes_up_to(lim);
+        } else if (!strncmp(buf,"gcd ",4) && sscanf(buf+4,"%lld %lld",&ia,&ib)==2) {
+            printf("  gcd(%lld, %lld) = %.0f\n\n", ia, ib, gcd_d((double)ia,(double)ib));
+        } else if (!strncmp(buf,"lcm ",4) && sscanf(buf+4,"%lld %lld",&ia,&ib)==2) {
+            double g = gcd_d((double)ia,(double)ib);
+            double l = (g==0)?0:fabs((double)(ia*ib))/g;
+            printf("  lcm(%lld, %lld) = %.0f\n\n", ia, ib, l);
+        } else if (!strncmp(buf,"base ",5)) {
+            long long n; int base;
+            if(sscanf(buf+5,"%lld %d",&n,&base)==2) base_convert(n,base);
+            else printf("  Usage: base <decimal_n> <target_base>\n");
+        } else {
+            printf("  Unknown command.\n");
+        }
+    }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ *  SECTION 15 — DISPLAY HELPERS
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+static const char *mode_str(void)
+{
+    switch(g_mode){
+        case MODE_DEG:  return "DEG";
+        case MODE_RAD:  return "RAD";
+        case MODE_GRAD: return "GRAD";
+        default:        return "???";
+    }
+}
+
+static void print_result(double v)
+{
+    if (g_error != ERR_NONE) {
+        printf("  %s\n\n", err_msg(g_error));
+        return;
+    }
+    /* Pick display format */
+    if (v != v)                        printf("  = NaN\n\n");
+    else if (v == HUGE_VAL)            printf("  = +Infinity\n\n");
+    else if (v == -HUGE_VAL)           printf("  = -Infinity\n\n");
+    else if (fabs(v)>=1e15||(fabs(v)<1e-5&&v!=0.0))
+                                       printf("  = %.15e\n\n", v);
+    else                               printf("  = %.15g\n\n", v);
+}
+
+static void print_constants(void)
+{
+    printf("\n  ── Mathematical Constants ──\n");
+    printf("    %-10s = %.15g\n", "pi",    CALC_PI);
+    printf("    %-10s = %.15g\n", "e",     CALC_E);
+    printf("    %-10s = %.15g\n", "phi",   CALC_PHI);
+    printf("    %-10s = %.15g\n", "sqrt2", CALC_SQRT2);
+    printf("    %-10s = %.15g\n", "ln2",   CALC_LN2);
+    printf("    %-10s = %.15g\n", "ans",   g_ans);
+    printf("\n  ── Physical Constants (reference only) ──\n");
+    printf("    Speed of light (c)   = 2.99792458e8  m/s\n");
+    printf("    Gravitational (G)    = 6.67430e-11   N·m²/kg²\n");
+    printf("    Planck (h)           = 6.62607015e-34 J·s\n");
+    printf("    Boltzmann (k)        = 1.380649e-23  J/K\n");
+    printf("    Electron charge (e)  = 1.602176634e-19 C\n");
+    printf("    Avogadro (Nₐ)        = 6.02214076e23 /mol\n\n");
+}
+
+static void print_help(void)
+{
+    printf("\n");
+    printf("  ╔════════════════════════════════════════════════════════╗\n");
+    printf("  ║        Scientific Calculator v%s — Help              ║\n", VERSION);
+    printf("  ╠════════════════════════════════════════════════════════╣\n");
+    printf("  ║  OPERATORS  : + - * / %% ^(power) !(factorial)         ║\n");
+    printf("  ║  GROUPING   : (  )                                     ║\n");
+    printf("  ╠════════════════════════════════════════════════════════╣\n");
+    printf("  ║  TRIG       : sin cos tan  asin acos atan              ║\n");
+    printf("  ║  HYPERBOLIC : sinh cosh tanh  asinh acosh atanh        ║\n");
+    printf("  ║  LOG / EXP  : ln  log  log2  log10  exp               ║\n");
+    printf("  ║  ROOTS      : sqrt  cbrt  sq                           ║\n");
+    printf("  ║  MISC       : abs ceil floor round fact sign inv       ║\n");
+    printf("  ║  CONVERT    : deg(rad→deg)  rad(deg→rad)              ║\n");
+    printf("  ╠════════════════════════════════════════════════════════╣\n");
+    printf("  ║  CONSTANTS  : pi  e  phi  sqrt2  ln2  ans  inf        ║\n");
+    printf("  ║  MEMORY     : mem0 … mem9  (read in expression)        ║\n");
+    printf("  ╠════════════════════════════════════════════════════════╣\n");
+    printf("  ║  COMMANDS                                              ║\n");
+    printf("  ║   :deg / :rad / :grad  — set angle mode               ║\n");
+    printf("  ║   :mode                — show current angle mode       ║\n");
+    printf("  ║   :ms N                — store ans → mem N (0-9)       ║\n");
+    printf("  ║   :mr N                — recall mem N                  ║\n");
+    printf("  ║   :ma N                — add ans to mem N              ║\n");
+    printf("  ║   :mc N                — clear mem N                   ║\n");
+    printf("  ║   :mlist               — list all memory slots         ║\n");
+    printf("  ║   :hist                — show calculation history       ║\n");
+    printf("  ║   :clrhist             — clear history                  ║\n");
+    printf("  ║   :const               — list constants                 ║\n");
+    printf("  ║   :stat                — statistics sub-mode            ║\n");
+    printf("  ║   :matrix              — matrix sub-mode                ║\n");
+    printf("  ║   :conv                — unit conversion sub-mode       ║\n");
+    printf("  ║   :extras              — quadratic / primes / gcd / ... ║\n");
+    printf("  ║   :help / :h           — this help screen               ║\n");
+    printf("  ║   :quit / :q           — exit                           ║\n");
+    printf("  ╠════════════════════════════════════════════════════════╣\n");
+    printf("  ║  EXAMPLES                                              ║\n");
+    printf("  ║   sin(45)              (degrees mode)                  ║\n");
+    printf("  ║   log(1000)            → 3                             ║\n");
+    printf("  ║   2^10                 → 1024                          ║\n");
+    printf("  ║   sqrt(2)*pi           → 4.44288…                      ║\n");
+    printf("  ║   5! + 3^4             → 120 + 81 = 201                ║\n");
+    printf("  ║   (2+3i)  ← not supported (use :extras for complex)   ║\n");
+    printf("  ╚════════════════════════════════════════════════════════╝\n\n");
+}
+
+static void print_banner(void)
+{
+    printf("\n");
+    printf("  ╔══════════════════════════════════════════════╗\n");
+    printf("  ║      Scientific Calculator  v%s             ║\n", VERSION);
+    printf("  ║   Type  :help  for commands  :quit  to exit  ║\n");
+    printf("  ╚══════════════════════════════════════════════╝\n\n");
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ *  SECTION 16 — COMMAND DISPATCHER
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+/* Returns 0 → continue, -1 → quit */
+static int handle_cmd(const char *cmd)
+{
+    if (!strcmp(cmd,":quit")||!strcmp(cmd,":q"))    return -1;
+    if (!strcmp(cmd,":help")||!strcmp(cmd,":h"))    { print_help();     return 0; }
+    if (!strcmp(cmd,":deg"))                        { g_mode=MODE_DEG;  printf("  Mode: DEG\n\n"); return 0; }
+    if (!strcmp(cmd,":rad"))                        { g_mode=MODE_RAD;  printf("  Mode: RAD\n\n"); return 0; }
+    if (!strcmp(cmd,":grad"))                       { g_mode=MODE_GRAD; printf("  Mode: GRAD\n\n");return 0; }
+    if (!strcmp(cmd,":mode"))                       { printf("  Angle mode: %s\n\n",mode_str()); return 0; }
+    if (!strcmp(cmd,":hist"))                       { hist_print();     return 0; }
+    if (!strcmp(cmd,":clrhist"))                    { g_hist_n=0; printf("  History cleared.\n\n"); return 0; }
+    if (!strcmp(cmd,":const"))                      { print_constants();return 0; }
+    if (!strcmp(cmd,":mlist"))                      { mem_list();       return 0; }
+    if (!strcmp(cmd,":stat"))                       { stat_mode();      return 0; }
+    if (!strcmp(cmd,":matrix"))                     { matrix_mode();    return 0; }
+    if (!strcmp(cmd,":conv"))                       { conv_mode();      return 0; }
+    if (!strcmp(cmd,":extras"))                     { extras_mode();    return 0; }
+
+    int slot;
+    if (!strncmp(cmd,":ms ",4)&&sscanf(cmd+4,"%d",&slot)==1) { mem_store(slot,g_ans);    return 0; }
+    if (!strncmp(cmd,":mr ",4)&&sscanf(cmd+4,"%d",&slot)==1) { mem_recall(slot);         return 0; }
+    if (!strncmp(cmd,":ma ",4)&&sscanf(cmd+4,"%d",&slot)==1) { mem_add_slot(slot,g_ans); return 0; }
+    if (!strncmp(cmd,":mc ",4)&&sscanf(cmd+4,"%d",&slot)==1) { mem_clear(slot);          return 0; }
+
+    printf("  Unknown command: %s   (try :help)\n\n", cmd);
+    return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ *  SECTION 17 — MAIN LOOP
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+int main(void)
+{
+    char line[MAX_EXPR];
+    memset(g_mem, 0, sizeof(g_mem));
+
+    print_banner();
+    printf("  [%s] ", mode_str()); fflush(stdout);
+
+    while (fgets(line, sizeof(line), stdin)) {
+        /* Strip trailing newline / CR */
+        line[strcspn(line, "\r\n")] = '\0';
+
+        /* Skip blank lines */
+        if (line[0] == '\0') {
+            printf("  [%s] ", mode_str()); fflush(stdout);
+            continue;
+        }
+
+        /* Command path */
+        if (line[0] == ':') {
+            if (handle_cmd(line) == -1) break;
+            printf("  [%s] ", mode_str()); fflush(stdout);
+            continue;
+        }
+
+        /* Expression path */
+        double result = evaluate(line);
+        if (g_error == ERR_NONE) {
+            g_ans = result;
+            hist_add(line, result);
+        }
+        print_result(result);
+        printf("  [%s] ", mode_str()); fflush(stdout);
+    }
+
+    printf("\n  Goodbye!\n\n");
+    return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ *  END OF sci_calc.c
+ *
+ *  Compilation reminder:
+ *    gcc -Wall -Wextra -O2 -o sci_calc sci_calc.c -lm
+ *
+ *  Quick usage examples (DEG mode default):
+ *    sin(30)            →  0.5
+ *    cos(60) + tan(45)  →  1.5
+ *    2^10               →  1024
+ *    sqrt(2) * pi       →  4.44288293816…
+ *    ln(e)              →  1
+ *    log(1000)          →  3
+ *    5! + 3^4           →  201
+ *    (1+sqrt(5))/2      →  phi = 1.61803…  (compute it)
+ *    :extras  → quad 1 -3 2  →  roots at x=2, x=1
+ *    :stat    → add 4 | add 7 | add 10 | compute
+ *    :conv    → len 1 mi km  →  1.609344 km
+ *    :matrix  → input A | input B | mul | det A
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
